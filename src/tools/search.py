@@ -67,7 +67,17 @@ class PlayerSearch:
             db = db[db["position_group"] == position_group.upper()]
 
         if team:
-            db = db[db["team"].str.contains(team, case=False, na=False)]
+            import unicodedata
+            def remove_accents(text):
+                if pd.isna(text):
+                    return ""
+                nfkd = unicodedata.normalize("NFKD", str(text))
+                return "".join(c for c in nfkd if not unicodedata.combining(c))
+
+            clean_team = remove_accents(team).lower()
+            db = db[db["team"].apply(
+                lambda x: clean_team in remove_accents(x).lower()
+            )]
 
         if competition:
             db = db[db["competition"].str.contains(competition, case=False, na=False)]
@@ -88,6 +98,14 @@ class PlayerSearch:
             "interceptions_per90": min_interceptions_per90,
             "tackles_won_per90": min_tackles_won_per90,
         }
+
+        # Try alternative column names for FBref data
+        alt_metric_filters = {
+            "progressive_carries_per90": min_dribbles_completed_per90,
+        }
+        for col, min_val in alt_metric_filters.items():
+            if min_val is not None and col in db.columns and "dribbles_completed_per90" not in db.columns:
+                db = db[db[col] >= min_val]
 
         for col, min_val in metric_filters.items():
             if min_val is not None and col in db.columns:

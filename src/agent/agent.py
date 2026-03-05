@@ -8,7 +8,8 @@ import os
 
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage
+from typing import Generator
 from langgraph.prebuilt import create_react_agent
 
 from src.agent.prompts import SYSTEM_PROMPT
@@ -59,7 +60,7 @@ class ScoutingAgent:
         self.chat_history.append(HumanMessage(content=user_message))
 
         response = self.agent.invoke({
-            "messages": self.chat_history,
+            "messages": self._trimmed_history(),
         })
 
         # Get the last AI message
@@ -76,10 +77,64 @@ class ScoutingAgent:
         self.chat_history = response["messages"]
         return reply
 
+    def stream_steps(self, user_message: str) -> Generator:
+        """Run the agent and yield step events for live UI feedback.
+
+        Uses invoke() for reliability, then walks the new messages to emit
+        tool-call events before the final response.
+
+        Yields:
+            ("tool_call", tool_name)  — each tool invoked during reasoning
+            ("error",     error_msg)  — if the agent fails
+            ("response",  final_text) — the final AI reply
+        """
+        self.chat_history.append(HumanMessage(content=user_message))
+        trimmed = self._trimmed_history()
+        history_len = len(trimmed)
+
+        try:
+            response = self.agent.invoke({"messages": trimmed})
+            new_messages = response["messages"][history_len - 1:]  # messages added this turn
+
+            # Yield tool_call events from the new message sequence
+            for msg in new_messages:
+                if getattr(msg, "tool_calls", None):
+                    for tc in msg.tool_calls:
+                        yield ("tool_call", tc["name"])
+
+            # Extract final text reply
+            ai_messages = [
+                m for m in response["messages"]
+                if getattr(m, "type", None) == "ai" and getattr(m, "content", None)
+                and not getattr(m, "tool_calls", None)
+            ]
+            final_reply = ai_messages[-1].content if ai_messages else ""
+            self.chat_history = response["messages"]
+
+        except Exception as e:
+            logger.error(f"Agent error: {e}", exc_info=True)
+            self.chat_history.pop()  # restore history to pre-call state
+            yield ("error", str(e))
+            final_reply = f"I encountered an error: {e}"
+
+        yield ("response", final_reply or "I couldn't process that request. Please try again.")
+
     def reset(self):
         """Reset conversation history."""
         self.chat_history = []
         logger.info("Conversation history reset.")
+
+    def _trimmed_history(self, max_messages: int = 12) -> list:
+        """Return recent history capped at max_messages to avoid context overflow.
+
+        Always keeps the last max_messages entries (tool results count as
+        individual messages, so 12 ≈ 3 full tool-using turns).
+        """
+        if len(self.chat_history) <= max_messages:
+            return self.chat_history
+        trimmed = self.chat_history[-max_messages:]
+        logger.debug(f"History trimmed from {len(self.chat_history)} to {len(trimmed)} messages")
+        return trimmed
 
 
 def run_interactive():

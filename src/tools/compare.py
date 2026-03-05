@@ -42,13 +42,36 @@ class PlayerComparison:
             return pd.DataFrame()
 
         # Find each player
+        import unicodedata
+
+        def remove_accents(text):
+            if pd.isna(text):
+                return ""
+            nfkd = unicodedata.normalize("NFKD", str(text))
+            return "".join(c for c in nfkd if not unicodedata.combining(c))
+
         players = []
         for name in player_names:
             mask = db["player"].str.contains(name, case=False, na=False)
+
+            # Try without accents if not found
+            if not mask.any():
+                clean_name = remove_accents(name).lower()
+                mask = db["player"].apply(
+                    lambda x: clean_name in remove_accents(x).lower()
+                )
+
             if not mask.any():
                 logger.warning(f"Player '{name}' not found!")
                 continue
-            players.append(db[mask].iloc[0])
+
+            # Prefer current season
+            matches = db[mask]
+            current = matches[matches.get("season", "") == "2024/2025"]
+            if not current.empty:
+                players.append(current.iloc[0])
+            else:
+                players.append(matches.iloc[0])
 
         if len(players) < 2:
             logger.warning("Need at least 2 valid players!")

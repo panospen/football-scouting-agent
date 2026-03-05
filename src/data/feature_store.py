@@ -12,6 +12,7 @@ import pandas as pd
 
 from src.data.loader import StatsBombLoader, COMPETITIONS
 from src.data.preprocessor import Preprocessor
+from src.data.fbref_loader import FBrefLoader
 
 logger = logging.getLogger(__name__)
 
@@ -44,11 +45,71 @@ class FeatureStore:
             logger.info("Loading player database from cache...")
             return pd.read_parquet(cache_path)
 
+        # Try to build from FBref + StatsBomb
         logger.warning(
             "No cached player database found. Run build_player_db() first."
         )
         return pd.DataFrame()
 
+    def build_combined_db(self) -> pd.DataFrame:
+        """Build combined database: StatsBomb + FBref 2024/25."""
+        # Load existing StatsBomb data
+        statsbomb_path = self.processed_dir / "player_database.parquet"
+        if statsbomb_path.exists():
+            statsbomb_db = pd.read_parquet(statsbomb_path)
+            logger.info(f"Loaded StatsBomb data: {len(statsbomb_db)} players")
+        else:
+            statsbomb_db = pd.DataFrame()
+            logger.warning("No StatsBomb data found!")
+
+        # Load FBref data
+        fbref_loader = FBrefLoader()
+        fbref_db = fbref_loader.load_and_process(min_minutes=300)
+        logger.info(f"Loaded FBref data: {len(fbref_db)} players")
+
+        if statsbomb_db.empty and fbref_db.empty:
+            logger.error("No data available!")
+            return pd.DataFrame()
+
+        # Align FBref columns to match StatsBomb format
+        # Find common columns and fill missing ones
+        if not statsbomb_db.empty and not fbref_db.empty:
+            # Add missing columns to FBref data with 0
+            for col in statsbomb_db.columns:
+                if col not in fbref_db.columns:
+                    fbref_db[col] = 0 if statsbomb_db[col].dtype in ['float64', 'int64'] else ""
+
+            # Add missing columns to StatsBomb data
+            for col in fbref_db.columns:
+                if col not in statsbomb_db.columns:
+                    statsbomb_db[col] = 0 if fbref_db[col].dtype in ['float64', 'int64'] else ""
+
+            # Use only common columns for concat
+            common_cols = list(set(statsbomb_db.columns) & set(fbref_db.columns))
+            combined = pd.concat(
+                [statsbomb_db[common_cols], fbref_db[common_cols]],
+                ignore_index=True,
+            )
+        elif not fbref_db.empty:
+            combined = fbref_db
+        else:
+            combined = statsbomb_db
+
+        # Save combined database
+        combined_path = self.processed_dir / "player_database_combined.parquet"
+        combined.to_parquet(combined_path)
+
+        # Also save as the main database
+        main_path = self.processed_dir / "player_database.parquet"
+        combined.to_parquet(main_path)
+
+        logger.info(
+            f"Combined database: {len(combined)} players saved to {main_path}"
+        )
+
+        self._player_db = combined
+        return combined
+    
     def build_player_db(
         self,
         competitions: Optional[list] = None,
@@ -129,16 +190,57 @@ class FeatureStore:
 
     def get_player(self, player_name: str) -> Optional[pd.Series]:
         """Get stats for a specific player."""
+        import unicodedata
+
         db = self.player_db
         if db.empty:
             return None
+
+        def remove_accents(text):
+            if pd.isna(text):
+                return ""
+            nfkd = unicodedata.normalize("NFKD", str(text))
+            return "".join(c for c in nfkd if not unicodedata.combining(c))
+
+        # Try direct contains match
         matches = db[
             db["player"].str.contains(player_name, case=False, na=False)
         ]
+
+        # Try without accents
+        if matches.empty:
+            clean_name = remove_accents(player_name).lower()
+            mask = db["player"].apply(
+                lambda x: clean_name in remove_accents(x).lower()
+            )
+            matches = db[mask]
+
+        # Try matching each word separately (e.g. "Lionel Messi" matches "Lionel Andrés Messi Cuccittini")
+        if matches.empty:
+            words = remove_accents(player_name).lower().split()
+            if len(words) >= 2:
+                mask = db["player"].apply(
+                    lambda x: all(w in remove_accents(x).lower() for w in words)
+                )
+                matches = db[mask]
+
         if matches.empty:
             return None
-        return matches.iloc[0]
 
+        # Prefer current season data
+        if "season" in matches.columns and len(matches) > 1:
+            current = matches[matches["season"] == "2024/2025"]
+            if not current.empty:
+                return current.iloc[0]
+
+        # Prefer StatsBomb data for historical players (has event data)
+        if "data_source" in matches.columns and len(matches) > 1:
+            statsbomb = matches[matches["data_source"] != "FBref"]
+            if not statsbomb.empty:
+                return statsbomb.iloc[0]
+
+        return matches.iloc[0]
+    
     def search(self, **filters) -> pd.DataFrame:
         """Search players with filters.
 

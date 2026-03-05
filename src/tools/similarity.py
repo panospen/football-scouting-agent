@@ -76,9 +76,25 @@ class PlayerSimilarity:
             return pd.DataFrame()
 
         # Find target player
+        import unicodedata
+
+        def remove_accents(text):
+            if pd.isna(text):
+                return ""
+            nfkd = unicodedata.normalize("NFKD", str(text))
+            return "".join(c for c in nfkd if not unicodedata.combining(c))
+
         target_mask = db["player"].str.contains(
             player_name, case=False, na=False
         )
+
+        # Try without accents
+        if not target_mask.any():
+            clean_name = remove_accents(player_name).lower()
+            target_mask = db["player"].apply(
+                lambda x: clean_name in remove_accents(x).lower()
+            )
+
         if not target_mask.any():
             logger.warning(f"Player '{player_name}' not found!")
             return pd.DataFrame()
