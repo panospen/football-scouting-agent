@@ -29,6 +29,12 @@ class ScoutingAgent:
     ):
         api_key = os.getenv("GROQ_API_KEY")
         if not api_key:
+            try:
+                import streamlit as st
+                api_key = st.secrets.get("GROQ_API_KEY")
+            except Exception:
+                pass
+        if not api_key:
             raise ValueError(
                 "GROQ_API_KEY not found! Add it to your .env file."
             )
